@@ -1,1 +1,205 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from obspy import read, UTCDateTime
+from scipy.interpolate import interp1d
+from obspy.io.sac import SACTrace
+import matplotlib.patches as patches
+
+def read_stations_file(stations_file):
+    stations = {}
+    with open(stations_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            name = parts[0]
+            lat = float(parts[1])
+            lon = float(parts[2])
+            stations[name] = (lat, lon)
+    return stations
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, sqrt, atan2
+
+    R = 6371.0  # Earth radius in kilometers
+
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    distance = R * c
+    return distance
+
+def radon_transform(traces, distances, p_min, p_max, p_steps, dt):
+    n_traces, n_samples = traces.shape
+    p = np.linspace(p_min, p_max, p_steps)
+    tau_p = np.zeros((p_steps, n_samples))
+
+    for i, pi in enumerate(p):
+        for j in range(n_traces):
+            delay_samples = distances[j] * pi / dt
+            x = np.arange(n_samples)
+            interp_func = interp1d(x - delay_samples, traces[j], bounds_error=False, fill_value=0)
+            shifted_trace = interp_func(x)
+            tau_p[i, :] += shifted_trace
+
+    tau = np.linspace(-200, 200, n_samples)
+    
+    return tau_p, p, tau
+
+def filter_radon_by_slowness_and_time(tau_p, p, tau):
+    filtered_tau_p = np.copy(tau_p)
+
+    for i, pi in enumerate(p):
+        # Exclude data in the red box region: -0.2 <= pi <= 0.2 and -30s <= tau <= 30s
+        if -0.2 <= pi <= 0.2:
+            time_mask = (tau >= -30) & (tau <= 30)
+            filtered_tau_p[i, time_mask] = 0
+
+    return filtered_tau_p
+
+def inverse_radon_transform(tau_p, distances, p_min, p_max, p_steps, dt, n_traces, n_samples):
+    p = np.linspace(p_min, p_max, p_steps)
+    reconstructed_traces = np.zeros((n_traces, n_samples))
+
+    for i, pi in enumerate(p):
+        for j in range(n_traces):
+            delay_samples = distances[j] * pi / dt
+            x = np.arange(n_samples)
+            interp_func = interp1d(x + delay_samples, tau_p[i, :], bounds_error=False, fill_value=0)
+            reconstructed_traces[j, :] += interp_func(x)
+
+    return reconstructed_traces
+
+def plot_tau_p(tau_p, p, tau, title="Radon Transform", save_path=None):
+    plt.figure(figsize=(10, 6))
+    plt.imshow(tau_p, aspect='auto', extent=[tau[0], tau[-1], p[-1], p[0]], cmap='viridis', vmin=-5, vmax=5)
+    plt.colorbar(label='Amplitude')
+    plt.xlabel('Time Lag (s)')
+    plt.ylabel('Slowness (s/km)')
+    plt.title(title)
+    plt.grid(True)
+
+    # Add the red rectangle: (-30s, -0.2 s/km) to (30s, 0.2 s/km)
+    red_rect = patches.Rectangle((-30, -0.2), 60, 0.4, linewidth=1, edgecolor='r', facecolor='none', linestyle='--')
+    plt.gca().add_patch(red_rect)
+
+    # Add the first yellow rectangle: (-15s, -0.5 s/km) to (5s, -0.25 s/km)
+    yellow_rect1 = patches.Rectangle((-15, -0.5), 20, 0.25, linewidth=1, edgecolor='yellow', facecolor='none', linestyle='--')
+    plt.gca().add_patch(yellow_rect1)
+
+    # Add the second yellow rectangle: (-5s, 0.25 s/km) to (15s, 0.5 s/km)
+    yellow_rect2 = patches.Rectangle((-5, 0.25), 20, 0.25, linewidth=1, edgecolor='yellow', facecolor='none', linestyle='--')
+    plt.gca().add_patch(yellow_rect2)
+
+    if save_path:
+        plt.savefig(save_path)
+    plt.close()
+
+def process_and_filter_sac(stations_file, folder, station_names, filterid, components, ampli=1, refilter=None, p_min=-0.6, p_max=0.6, p_steps=120):
+    stations = read_stations_file(stations_file)
+
+    maxlag = 200  # Adjust to -200 to 200 seconds
+    maxlagsamples = 8001  # Ensure sufficient resolution
+    dt = 0.05
+    t = np.linspace(-maxlag, maxlag, maxlagsamples)
+
+    if refilter:
+        freqmin, freqmax = refilter.split(':')
+        freqmin = float(freqmin)
+        freqmax = float(freqmax)
+
+    for station_name in station_names:
+        if station_name not in stations:
+            print(f"Station {station_name} not found in the stations file.")
+            continue
+
+        lat1, lon1 = stations[station_name]
+        traces = []
+        distances = []
+        valid_pairs = []
+
+        for sta2 in stations:
+            if station_name != sta2:
+                dist = calculate_distance(lat1, lon1, stations[sta2][0], stations[sta2][1])
+                pairs = [f"BR_{station_name}_BR_{sta2}", f"BR_{sta2}_BR_{station_name}"]
+                for pair in pairs:
+                    print(f"Processing pair: {pair}, Distance: {dist:.2f} km")
+                    rf = os.path.join(folder, f"{pair}.SAC")
+                    if os.path.isfile(rf):
+                        try:
+                            st = read(rf)
+                            st.merge(method=1, fill_value=0)
+                            st.trim(UTCDateTime(-maxlag), UTCDateTime(maxlag))
+                            ref = st[0].data
+
+                            if len(ref) > len(t):
+                                ref = ref[:len(t)]
+                            elif len(ref) < len(t):
+                                ref = np.pad(ref, (0, len(t) - len(ref)), 'constant')
+
+                            if refilter:
+                                st.detrend("simple")
+                                st.taper(0.02)
+                                st.filter("bandpass", freqmin=freqmin, freqmax=freqmax, zerophase=True)
+                                ref = st[0].data
+                                if len(ref) > len(t):
+                                    ref = ref[:len(t)]
+                                elif len(ref) < len(t):
+                                    ref = np.pad(ref, (0, len(t) - len(ref)), 'constant')
+
+                            ref /= np.max(np.abs(ref))
+                            traces.append(ref * ampli)
+                            distances.append(dist)
+                            valid_pairs.append(pair)
+                        except Exception as e:
+                            print(f"Error reading file {rf}: {e}")
+                    else:
+                        print(f"File not found: {rf}")
+
+        if traces:
+            traces = np.array(traces)
+            tau_p, p, tau = radon_transform(traces, distances, p_min, p_max, p_steps, dt)
+
+            # Filter Radon domain by slowness and time intervals
+            filtered_tau_p = filter_radon_by_slowness_and_time(tau_p, p, tau)
+
+            # Inverse Radon transform to convert back to the time domain
+            reconstructed_traces = inverse_radon_transform(filtered_tau_p, distances, p_min, p_max, p_steps, dt, len(traces), len(t))
+
+            # Ensure the output directories exist for this station
+            output_folder = os.path.join("输出文件夹", station_name)
+            picture_folder = "pictureTT"
+            if not os.path.exists(output_folder):
+                os.makedirs(output_folder)
+            if not os.path.exists(picture_folder):
+                os.makedirs(picture_folder)
+
+            # Save the filtered cross-correlation data to SAC files
+            for i, pair in enumerate(valid_pairs):
+                rf = os.path.join(folder, f"{pair}.SAC")
+                if os.path.isfile(rf):
+                    sac = SACTrace.read(rf)
+                    sac.data = reconstructed_traces[i]
+                    sac.write(os.path.join(output_folder, f"{pair}.SAC"))
+
+            # Save the filtered Radon transform result as an image
+            plot_title = f'Radon Transform (Filtered): {components}, Filter {filterid}, Station {station_name}'
+            image_path = os.path.join(picture_folder, f'{station_name}_filtered.png')
+            plot_tau_p(filtered_tau_p, p, tau, title=plot_title, save_path=image_path)
+
+# Example usage
+station_names = [
+    "XXXX",....... ]
+process_and_filter_sac( 
+  stations_file="包含台站名经纬度txt文件", 
+  folder="文件夹", 
+  station_names=station_names, 
+  filterid=1, 
+  components="分量", 
+  ampli=1, 
+  refilter="0.1:1.0" )
 
